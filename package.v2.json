@@ -3,11 +3,12 @@
     "name": "Google Drive 归档桥接",
     "description": "将 MoviePilot 整理完成目录写入宿主机 gdrive-archiver 队列。",
     "labels": "文件整理,Google Drive,归档",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "icon": "Moviepilot_A.png",
     "author": "irisrclone",
     "level": 1,
     "history": {
+      "v1.0.2": "按媒体根目录聚合逐文件整理事件，并在元数据刮削调度后重新开始稳定等待。",
       "v1.0.1": "兼容类别位于路径第二层的旧整理目录。",
       "v1.0.0": "初始版本：TransferComplete 目录入队与可选结果通知。"
     }

@@ -19,7 +19,7 @@ class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "将整理完成目录原子写入宿主机 gdrive-archiver 队列。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -118,6 +118,20 @@ class GDriveArchiverBridge(_PluginBase):
         event_data = event.event_data or {}
         transferinfo = event_data.get("transferinfo")
         target_diritem = getattr(transferinfo, "target_diritem", None)
+        target_item = getattr(transferinfo, "target_item", None)
+        self._enqueue_directory(
+            target_diritem,
+            "transfer_complete",
+            getattr(target_item, "path", None),
+        )
+
+    @eventmanager.register(EventType.MetadataScrape)
+    def enqueue_metadata_scrape(self, event: Event):
+        if not self._enabled:
+            return
+        self._enqueue_directory((event.event_data or {}).get("fileitem"), "metadata_scrape")
+
+    def _enqueue_directory(self, target_diritem: Any, trigger: str, completed_path: Any = None):
         target_path = getattr(target_diritem, "path", None)
         if not target_path:
             return
@@ -134,24 +148,36 @@ class GDriveArchiverBridge(_PluginBase):
 
         relative = relative_path.as_posix()
         job_id = hashlib.sha256(relative.encode("utf-8")).hexdigest()
+        completed_item = ""
+        if completed_path:
+            try:
+                completed_item = Path(completed_path).resolve().relative_to(target).as_posix()
+            except (OSError, ValueError) as err:
+                logger.warning("Google Drive 归档桥接无法定位已整理文件 %s：%s", completed_path, err)
+        queue_id = hashlib.sha256(
+            f"{job_id}\x00{trigger}\x00{completed_item}".encode("utf-8")
+        ).hexdigest()
         job = {
             "version": 1,
             "id": job_id,
             "source_path": str(target),
             "relative_path": relative,
+            "trigger": trigger,
+            "completed_item": completed_item,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            self._write_job(job)
-            logger.info("Google Drive 归档已入队：%s", relative)
+            self._write_job(job, queue_id)
+            suffix = f" / {completed_item}" if completed_item else ""
+            logger.info("Google Drive 归档已入队（%s）：%s%s", trigger, relative, suffix)
         except OSError as err:
             logger.error("Google Drive 归档入队失败 %s：%s", relative, err)
 
-    def _write_job(self, job: Dict[str, Any]):
+    def _write_job(self, job: Dict[str, Any], queue_id: str):
         inbox = Path(self._bridge_dir) / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
-        destination = inbox / f"{job['id']}.json"
-        temporary = inbox / f".{job['id']}.{uuid.uuid4().hex}.tmp"
+        destination = inbox / f"{queue_id}.json"
+        temporary = inbox / f".{queue_id}.{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("x", encoding="utf-8") as file:
                 json.dump(job, file, ensure_ascii=False, separators=(",", ":"))

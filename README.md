@@ -2,7 +2,7 @@
 
 这是 `gdrive-archiver` 的 MoviePilot V2 事件桥接插件。它不运行 rclone，不访问 Google Drive，也不删除媒体文件。
 
-插件监听 `EventType.TransferComplete`，从 `transferinfo.target_diritem.path` 取得 MoviePilot 的整理目标目录；以 `library_root`（默认 `/media`）计算相对路径，然后原子写入 `bridge_dir/inbox`（默认 `/bridge/inbox`）。同一目录的重复事件会覆盖为同一 job，因此可安全地由逐文件事件聚合为一个目录任务。
+插件用 `TransferComplete` 发现媒体根目录，并用 `MetadataScrape`（若 MP 启动刮削）在全部整理任务汇总、刮削已调度后重新开始等待。前者按主媒体文件触发，后者不是刮削完成事件；两者都以 `target_diritem.path`（MP 定义的媒体根目录）计算相对路径，写入同一个原子 job。宿主机仅在目录持续静默后递归上传，因此多集剧集、字幕、NFO 和图片会被合并为一次归档。
 
 ## Docker 挂载
 
@@ -58,6 +58,8 @@ mp-plugin/
   "id": "sha256(relative_path)",
   "source_path": "/media/日韩电影/血战冲绳岛 (1971) {tmdbid=130853}",
   "relative_path": "日韩电影/血战冲绳岛 (1971) {tmdbid=130853}",
+  "trigger": "transfer_complete",
+  "completed_item": "血战冲绳岛 (1971) - 1080p - BluRay REMUX.mkv",
   "created_at": "2026-08-01T00:00:00+00:00"
 }
 ```
