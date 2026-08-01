@@ -19,7 +19,7 @@ class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "将整理完成目录原子写入宿主机 gdrive-archiver 队列。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -139,7 +139,6 @@ class GDriveArchiverBridge(_PluginBase):
             "id": job_id,
             "source_path": str(target),
             "relative_path": relative,
-            "category": relative_path.parts[0],
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         try:

@@ -58,9 +58,8 @@ mp-plugin/
   "id": "sha256(relative_path)",
   "source_path": "/media/日韩电影/血战冲绳岛 (1971) {tmdbid=130853}",
   "relative_path": "日韩电影/血战冲绳岛 (1971) {tmdbid=130853}",
-  "category": "日韩电影",
   "created_at": "2026-08-01T00:00:00+00:00"
 }
 ```
 
-`category` 只用于宿主上传器选择对应的 Team Drive；`relative_path` 的其余层级必须原样保留。上传器必须等待目录稳定后再递归扫描，这样 MoviePilot 随后写入的 NFO、字幕和图片也会一起上传。
+宿主上传器始终以 `relative_path` 路由 Team Drive：它优先识别第一层类别；若第一层是旧整理规则留下的外层分组，则识别第二层类别。例如 `电影/日韩电影/片名` 与 `日韩电影/片名` 都会上传到“日韩电影”盘的 `片名` 路径。上传器必须等待目录稳定后再递归扫描，这样 MoviePilot 随后写入的 NFO、字幕和图片也会一起上传。
