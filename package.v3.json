@@ -1,0 +1,15 @@
+{
+  "GDriveArchiverBridge": {
+    "name": "Google Drive 归档桥接",
+    "description": "整理事件桥接、归档仪表盘与宿主机控制（MoviePilot V3）。",
+    "labels": "文件整理,Google Drive,归档,仪表板",
+    "version": "3.0.0",
+    "icon": "Moviepilot_A.png",
+    "author": "irisrclone",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v3.0.0": "使用 V3 稳定 SDK；支持原生仪表盘、鉴权控制回执、整理事件入队与通知恢复。"
+    }
+  }
+}
