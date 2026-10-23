@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import NotificationType
+from app.schemas import DownloaderInfo, NotificationType
 from app.schemas.types import EventType
 
 
@@ -305,7 +305,7 @@ class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "整理事件入队、归档状态仪表盘与宿主机控制。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.1.1"
+    plugin_version = "2.2.0"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -317,6 +317,7 @@ class GDriveArchiverBridge(_PluginBase):
         self._lock = threading.RLock()
         self._enabled = False
         self._notify_results = False
+        self._aggregate_upload_speed = True
         self._library_root = "/media"
         self._bridge_dir = "/bridge"
         self._outbox_poll_seconds = 3
@@ -337,6 +338,7 @@ class GDriveArchiverBridge(_PluginBase):
             self._bridge_dir = str(config.get("bridge_dir") or "/bridge")
             self._enabled = config.get("enabled") is True
             self._notify_results = config.get("notify_results") is True
+            self._aggregate_upload_speed = config.get("aggregate_upload_speed", True) is True
             try:
                 self._outbox_poll_seconds = max(2, min(5, int(config.get("outbox_poll_seconds") or 3)))
             except (ValueError, TypeError):
@@ -360,6 +362,25 @@ class GDriveArchiverBridge(_PluginBase):
 
     def get_state(self) -> bool:
         return self._enabled
+
+    def get_module(self):
+        if not self._enabled or not self._aggregate_upload_speed:
+            return {}
+        return {"downloader_info": self.downloader_info}
+
+    def downloader_info(self, downloader: Optional[str] = None):
+        # A list appends to MP's system modules; a single object would replace
+        # the real downloaders. Never add global archiver traffic to a named one.
+        with self._lock:
+            if not self._enabled or not self._aggregate_upload_speed or downloader:
+                return []
+            try:
+                _, view = self._read_transfer_status()
+            except (OSError, ValueError, RecursionError):
+                return []
+        if view.speed_bytes_per_second <= 0:
+            return []
+        return [DownloaderInfo(upload_speed=view.speed_bytes_per_second)]
 
     @staticmethod
     def get_command():
@@ -395,6 +416,7 @@ class GDriveArchiverBridge(_PluginBase):
     def get_form(self):
         fields_json = homepage_action_fields(self) + [
             self._field("VSwitch", "enabled", "启用插件"),
+            self._field("VSwitch", "aggregate_upload_speed", "将归档上传速度计入首页实时速率"),
             self._field("VTextField", "library_root", "MoviePilot 媒体根目录"),
             self._field("VTextField", "bridge_dir", "共享 bridge 目录"),
             self._field("VSwitch", "notify_results", "通过 MoviePilot 发送结果通知"),
@@ -413,7 +435,7 @@ class GDriveArchiverBridge(_PluginBase):
         return [{"component": "VForm", "content": fields_json}], {
             "home_busy": False, "home_error": False, "home_message": "",
             "enabled": False, "library_root": "/media", "bridge_dir": "/bridge", "notify_results": False,
-            "outbox_poll_seconds": 3, "control_action": "", "control_job_id": "",
+            "aggregate_upload_speed": True, "outbox_poll_seconds": 3, "control_action": "", "control_job_id": "",
             "control_relative_path": "", "onlyonce": False}
 
     def _bridge_path(self, *parts):
@@ -449,35 +471,42 @@ class GDriveArchiverBridge(_PluginBase):
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _read_transfer_status(self):
+        """Share freshness rules without reading task history or command receipts."""
+        view = StatusView(enabled=self._enabled)
+        raw = self._read_json(self._bridge_path("status.json"), 2 * 1024 * 1024)
+        if type(raw.get("version")) is not int or raw["version"] != 2:
+            raise ValueError("需要支持状态协议 2 的宿主机归档器")
+        view.updated_at = _text(raw.get("updated_at"))
+        stamp = _time(view.updated_at)
+        age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp else -1
+        view.running = raw.get("running") is True
+        view.stale = not (0 <= age <= 15)
+        view.online = view.running and not view.stale
+        view.paused = raw.get("paused") is True
+        view.upload_workers = _number(raw.get("upload_workers"), True)
+        view.max_uploads_per_account = _number(raw.get("max_uploads_per_account"), True)
+        rows = raw.get("uploads")
+        view.uploads = [item for row in rows[:100] if (item := _model(UploadView, row)) is not None] if isinstance(rows, list) else []
+        for upload in view.uploads:
+            stamp = _time(upload.updated_at)
+            age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp else -1
+            upload.active = view.online and 0 <= age <= 15 and upload.phase in {"uploading", "moving", "checking_size"}
+            if not upload.active:
+                upload.speed = 0
+                upload.eta_seconds = -1
+        view.speed_bytes_per_second = sum(u.speed for u in view.uploads if u.active and u.phase == "uploading")
+        return raw, view
+
     def get_status(self) -> StatusView:
         view = StatusView(enabled=self._enabled)
         try:
-            raw = self._read_json(self._bridge_path("status.json"), 2 * 1024 * 1024)
-            if type(raw.get("version")) is not int or raw["version"] != 2:
-                raise ValueError("需要支持状态协议 2 的宿主机归档器")
-            view.updated_at = _text(raw.get("updated_at"))
-            stamp = _time(view.updated_at)
-            age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp else -1
-            view.running = raw.get("running") is True
-            view.stale = not (0 <= age <= 15)
-            view.online = view.running and not view.stale
-            view.paused = raw.get("paused") is True
-            view.upload_workers = _number(raw.get("upload_workers"), True)
-            view.max_uploads_per_account = _number(raw.get("max_uploads_per_account"), True)
-            view.speed_bytes_per_second = _number(raw.get("speed_bytes_per_second")) if view.online else 0
-            for name, cls, limit in [("jobs", JobView, 1000), ("uploads", UploadView, 100),
-                                     ("accounts", AccountView, 500), ("recent_events", EventView, 50)]:
+            raw, view = self._read_transfer_status()
+            for name, cls, limit in [("jobs", JobView, 1000), ("accounts", AccountView, 500),
+                                     ("recent_events", EventView, 50)]:
                 rows = raw.get(name)
                 setattr(view, name, [item for row in rows[:limit] if (item := _model(cls, row)) is not None]
                         if isinstance(rows, list) else [])
-            for upload in view.uploads:
-                stamp = _time(upload.updated_at)
-                age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp else -1
-                upload.active = view.online and 0 <= age <= 15 and upload.phase in {"uploading", "moving", "checking_size"}
-                if not upload.active:
-                    upload.speed = 0
-                    upload.eta_seconds = -1
-            view.speed_bytes_per_second = sum(u.speed for u in view.uploads if u.active and u.phase == "uploading")
             warnings = raw.get("warnings")
             view.warnings = [_text(x) for x in warnings[:20] if isinstance(x, str)] if isinstance(warnings, list) else []
             counts = raw.get("job_counts")

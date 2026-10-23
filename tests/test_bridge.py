@@ -7,13 +7,22 @@ import sys
 import tempfile
 import types
 import unittest
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass
+class HostDownloaderInfo:
+    download_speed: float = 0.0
+    upload_speed: float = 0.0
+    download_size: float = 0.0
+    upload_size: float = 0.0
+    free_space: float = 0.0
 
 
 class HostPlugin:
@@ -57,6 +66,7 @@ def load_plugin(version):
         sys.modules[name]._PluginBase = HostPlugin
     for name in ("app.log", "app.sdk.logging"):
         sys.modules[name].logger = logger
+    sys.modules["app.schemas"].DownloaderInfo = HostDownloaderInfo
     sys.modules["app.schemas"].NotificationType = types.SimpleNamespace(Plugin="plugin")
     sys.modules["app.schemas.types"].EventType = events
     # Make the wrong host imports fail: tests must exercise the correct variant.
@@ -290,12 +300,12 @@ class DistributionTests(unittest.TestCase):
     def test_self_contained_versions_stay_in_parity(self):
         v2 = (ROOT / "plugins.v2/gdrivearchiverbridge/__init__.py").read_text(encoding="utf-8")
         v3 = (ROOT / "plugins.v3/gdrivearchiverbridge/__init__.py").read_text(encoding="utf-8")
-        v2 = v2.replace("app.core.event", "app.sdk.events").replace("app.log import", "app.sdk.logging import").replace("app.plugins import", "app.sdk.plugin import").replace('plugin_version = "2.1.1"', 'plugin_version = "3.1.1"')
+        v2 = v2.replace("app.core.event", "app.sdk.events").replace("app.log import", "app.sdk.logging import").replace("app.plugins import", "app.sdk.plugin import").replace('plugin_version = "2.2.0"', 'plugin_version = "3.2.0"')
         self.assertEqual(v2, v3)
         for version in (2, 3):
             manifest = json.loads((ROOT / f"package.v{version}.json").read_text(encoding="utf-8"))["GDriveArchiverBridge"]
-            self.assertEqual(f"{version}.1.1", manifest["version"])
-            self.assertIn(f"v{version}.1.1", manifest["history"])
+            self.assertEqual(f"{version}.2.0", manifest["version"])
+            self.assertIn(f"v{version}.2.0", manifest["history"])
             self.assertIn(f">={version}.0.0", manifest["system_version"])
 
 
