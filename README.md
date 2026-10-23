@@ -8,8 +8,8 @@
 
 | MoviePilot | 索引 | 自包含源码 | 插件版本 |
 | --- | --- | --- | --- |
-| V2，`>=2.0.0,<3.0.0` | `package.v2.json` | `plugins.v2/gdrivearchiverbridge/__init__.py` | 2.1.0 |
-| V3，`>=3.0.0` | `package.v3.json` | `plugins.v3/gdrivearchiverbridge/__init__.py` | 3.1.0 |
+| V2，`>=2.0.0,<3.0.0` | `package.v2.json` | `plugins.v2/gdrivearchiverbridge/__init__.py` | 2.1.1 |
+| V3，`>=3.0.0` | `package.v3.json` | `plugins.v3/gdrivearchiverbridge/__init__.py` | 3.1.1 |
 
 V2 使用对应的历史宿主导入；V3 使用 `app.sdk.plugin`、`app.sdk.events` 和 `app.sdk.logging`。两个目录都能单独被 MP 安装，不需要安装另一版本的源码，无额外 Python 依赖。
 

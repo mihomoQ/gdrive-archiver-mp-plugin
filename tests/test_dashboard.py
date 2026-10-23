@@ -217,6 +217,55 @@ class DashboardContract:
         buttons = [n for n in nodes(form) if n.get("component") == "VBtn"]
         self.assertTrue(any(n.get("text") == "显示到首页" for n in buttons))
 
+    def icon_surfaces(self):
+        scenarios = {
+            "offline": {"age": 30},
+            "paused": {"paused": True},
+            "active": {"uploads": [self.upload()]},
+            "errors": {"job_counts": {"failed": 1}},
+            "waiting": {"accounts": [{"name": "one", "status": "healthy"}]},
+        }
+        for scenario, value in scenarios.items():
+            self.status(**value)
+            yield scenario + "/home", self.widget()
+            yield scenario + "/detail", self.plugin.get_page()
+        yield "settings", self.plugin.get_form()[0]
+
+    def test_vicon_names_use_explicit_text_for_official_renderer_slot(self):
+        # Official V2/V3 DashboardRender always emits an interpolated Text slot.
+        # Its whitespace takes precedence over VIcon.props.icon in Vuetify3.7.3.
+        # A nonempty explicit icon-name text prevents a blank icon in the host.
+        for surface, content in self.icon_surfaces():
+            for node in nodes(content):
+                if node["component"] != "VIcon":
+                    continue
+                with self.subTest(surface=surface, icon=node.get("props", {}).get("icon")):
+                    name = node.get("text", "")
+                    self.assertRegex(name, r"^mdi[-:][a-z0-9-]+$")
+                    if "icon" in node.get("props", {}):
+                        self.assertEqual(node["props"]["icon"], name)
+
+    def test_all_icons_exist_in_both_offline_host_collections(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/moviepilot-mdi-supported.json").read_text(encoding="utf-8"))
+        allowed = set(fixture["intersection"])
+        self.assertGreater(len(allowed), 400, "fixture must contain the full host intersection, not our chosen icons")
+        self.assertEqual(set.intersection(*(set(branch["icons"]) for branch in fixture["branches"].values())), allowed)
+        for branch in fixture["branches"].values():
+            self.assertRegex(branch["commit"], r"^[0-9a-f]{40}$")
+        for surface, content in self.icon_surfaces():
+            names = set()
+            for node in nodes(content):
+                if node["component"] == "VIcon" and isinstance(node.get("text"), str):
+                    names.add(node["text"])
+                for key, value in node.get("props", {}).items():
+                    if key.replace("_", "-").lower().endswith("icon") and isinstance(value, str):
+                        names.add(value)
+            with self.subTest(surface=surface):
+                for name in names:
+                    self.assertRegex(name, r"^mdi[-:][a-z0-9-]+$")
+                missing = {name for name in names if name[4:] not in allowed}
+                self.assertEqual(set(), missing, f"icons missing from offline MP V2/V3 bundles: {sorted(missing)}")
+
 
 
 class V2DashboardTests(DashboardContract, unittest.TestCase):

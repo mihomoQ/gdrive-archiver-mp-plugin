@@ -291,7 +291,7 @@ def homepage_action_fields(plugin):
     )
     return [
         {"component": "VBtn", "props": {
-            "variant": "tonal", "color": "primary", "prepend-icon": "mdi-view-dashboard-plus-outline",
+            "variant": "tonal", "color": "primary", "prepend-icon": "mdi-view-dashboard-edit",
             "disabled": "{{ home_busy }}", "loading": "{{ home_busy }}", "onClick": action,
         }, "text": "显示到首页"},
         {"component": "VAlert", "props": {
@@ -305,7 +305,7 @@ class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "整理事件入队、归档状态仪表盘与宿主机控制。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -574,6 +574,10 @@ class GDriveArchiverBridge(_PluginBase):
     def _view_node(component, text=None, content=None, **props):
         """Use MP's escaped text interpolation; never emit a raw html node."""
         node = {"component": component}
+        # MP's renderer always supplies a default text slot. VIcon gives that
+        # slot priority over its icon prop, so an empty slot hides the icon.
+        if component == "VIcon" and text is None and isinstance(props.get("icon"), str):
+            text = props["icon"]
         if component == "VCard" and props.get("variant") == "outlined":
             props["style"] = props.get("style", "") + ";border:1px solid rgba(var(--v-theme-on-surface),0.12)"
         if props:
@@ -661,7 +665,7 @@ class GDriveArchiverBridge(_PluginBase):
         n = self._view_node
         active = len(summary["active"])
         if not state.online:
-            title, color, icon = "归档器离线", "grey", "mdi-cloud-off-outline"
+            title, color, icon = "归档器离线", "grey", "mdi-cloud-alert-outline"
             subtitle = "显示上次快照，等待归档器连接" if state.updated_at else "等待宿主机状态，请检查 bridge 目录"
         elif state.paused:
             title, color, icon = "暂停派发", "warning", "mdi-pause-circle-outline"
@@ -684,7 +688,7 @@ class GDriveArchiverBridge(_PluginBase):
                 cols=12, sm=8, **{"class": "d-flex align-center flex-wrap ga-2"}),
             n("VCol", text="最近同步 · " + self._ago(state.updated_at), cols=12, sm=4,
                 **{"class": "text-caption text-medium-emphasis text-sm-end"})], align="center", dense=True)
-        tiles = [("活动文件", str(active), f"上限 {state.upload_workers or '—'} 路", "mdi-file-upload-outline", color),
+        tiles = [("活动文件", str(active), f"上限 {state.upload_workers or '—'} 路", "mdi-file-upload", color),
                  ("当前速度", self._size(summary["speed"]) + "/s", "当前传输合计" if active else "当前没有活动上传", "mdi-speedometer", "primary"),
                  ("待处理任务", str(summary["pending"]), "含等待、重试与失败任务", "mdi-format-list-bulleted", "warning"),
                  ("健康账号", f"{summary['healthy']}/{len(state.accounts)}" if state.online else "—",
@@ -709,7 +713,7 @@ class GDriveArchiverBridge(_PluginBase):
         if not uploads:
             text = "已暂停新上传" if state.paused else "当前没有活动传输"
             return [n("VCard", content=[n("VCardText", content=[
-                n("VIcon", icon="mdi-tray-arrow-up", color="secondary", size=22),
+                n("VIcon", icon="mdi-upload", color="secondary", size=22),
                 n("span", text=text, **{"class": "text-body-2"})], **{"class": "d-flex align-center ga-2 py-4"})],
                 variant="tonal", rounded="lg")]
         cards = []

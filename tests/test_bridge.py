@@ -290,12 +290,12 @@ class DistributionTests(unittest.TestCase):
     def test_self_contained_versions_stay_in_parity(self):
         v2 = (ROOT / "plugins.v2/gdrivearchiverbridge/__init__.py").read_text(encoding="utf-8")
         v3 = (ROOT / "plugins.v3/gdrivearchiverbridge/__init__.py").read_text(encoding="utf-8")
-        v2 = v2.replace("app.core.event", "app.sdk.events").replace("app.log import", "app.sdk.logging import").replace("app.plugins import", "app.sdk.plugin import").replace('plugin_version = "2.1.0"', 'plugin_version = "3.1.0"')
+        v2 = v2.replace("app.core.event", "app.sdk.events").replace("app.log import", "app.sdk.logging import").replace("app.plugins import", "app.sdk.plugin import").replace('plugin_version = "2.1.1"', 'plugin_version = "3.1.1"')
         self.assertEqual(v2, v3)
         for version in (2, 3):
             manifest = json.loads((ROOT / f"package.v{version}.json").read_text(encoding="utf-8"))["GDriveArchiverBridge"]
-            self.assertEqual(f"{version}.1.0", manifest["version"])
-            self.assertIn(f"v{version}.1.0", manifest["history"])
+            self.assertEqual(f"{version}.1.1", manifest["version"])
+            self.assertIn(f"v{version}.1.1", manifest["history"])
             self.assertIn(f">={version}.0.0", manifest["system_version"])
 
 
