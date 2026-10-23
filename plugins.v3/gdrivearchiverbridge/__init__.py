@@ -44,8 +44,9 @@ class UploadView:
     size: int = 0
     bytes: int = 0
     speed: float = 0
-    eta_seconds: int = 0
+    eta_seconds: int = -1
     updated_at: str = ""
+    active: bool = False
 
 
 @dataclass
@@ -137,7 +138,12 @@ def _model(cls, value):
     result = {}
     for item in fields(cls):
         raw = value.get(item.name)
-        result[item.name] = _text(raw) if item.type is str else _number(raw, item.type is int)
+        if item.name == "eta_seconds":
+            result[item.name] = int(raw) if type(raw) in (int, float) and 0 <= raw <= 2 ** 63 - 1 and math.isfinite(raw) else -1
+        elif item.type is bool:
+            result[item.name] = raw is True
+        else:
+            result[item.name] = _text(raw) if item.type is str else _number(raw, item.type is int)
     return cls(**result)
 
 
@@ -159,11 +165,147 @@ def _get(value: Any, name: str):
     return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
 
 
+HOME_DASHBOARD_ACTION = r'''async function () {
+  if (model.home_busy) return;
+  model.home_busy = true;
+  model.home_error = false;
+  model.home_message = '正在读取当前用户的首页设置…';
+  let written = 0;
+  try {
+    const api = window.MoviePilotAPI;
+    if (!api || typeof api.get !== 'function' || typeof api.post !== 'function') {
+      throw new Error('当前前端未提供插件 API，请在首页设置中勾选 Google Drive 归档。');
+    }
+    const widget = __DASHBOARD_ID__;
+    const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+    const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const copy = value => JSON.parse(JSON.stringify(value));
+    const envelope = response => {
+      if (record(response) && !own(response, 'success') && record(response.data) &&
+          typeof response.data.success === 'boolean') return response.data;
+      return response;
+    };
+    const payload = response => {
+      const result = envelope(response);
+      if (record(result) && typeof result.success === 'boolean') {
+        if (!result.success) throw new Error('MoviePilot 拒绝了读取首页设置。');
+        return result.data;
+      }
+      return result;
+    };
+    const valueOf = response => {
+      const result = payload(response);
+      if (!record(result) || !own(result, 'value')) throw new Error('首页设置响应格式不受支持，未覆盖现有配置。');
+      return result.value;
+    };
+    const toggles = value => {
+      if (value === null || value === undefined) return undefined;
+      if (!record(value) || Object.values(value).some(flag => typeof flag !== 'boolean')) {
+        throw new Error('首页显示项格式不受支持，未覆盖现有配置。');
+      }
+      return copy(value);
+    };
+    const profile = value => {
+      if (value === null || value === undefined) return undefined;
+      if (!record(value)) throw new Error('首页布局格式不受支持，未覆盖现有配置。');
+      const wrapped = own(value, 'items') || own(value, 'enabled');
+      const result = wrapped ? copy(value) : {items: copy(value)};
+      result.items = result.items === undefined ? {} : result.items;
+      if (!record(result.items) || Object.values(result.items).some(item => !record(item))) {
+        throw new Error('首页布局格式不受支持，未覆盖现有配置。');
+      }
+      const enabled = toggles(result.enabled);
+      if (enabled === undefined) delete result.enabled;
+      else result.enabled = enabled;
+      if (result.updatedAt !== undefined &&
+          (!Number.isSafeInteger(result.updatedAt) || result.updatedAt <= 0)) {
+        throw new Error('首页布局时间格式不受支持，未覆盖现有配置。');
+      }
+      return result;
+    };
+    const specs = [
+      ['Dashboard', 'MP_DASHBOARD'],
+      ['DashboardGridLayout', 'MP_DASHBOARD_GRID_LAYOUT'],
+      ['DashboardGridLayoutTablet', 'MP_DASHBOARD_GRID_LAYOUT_TABLET'],
+      ['DashboardGridLayoutMobile', 'MP_DASHBOARD_GRID_LAYOUT_MOBILE']
+    ];
+    // Read every remote and browser value before performing the first write.
+    // A failure must not create a partial configuration from guessed defaults.
+    const local = specs.map((spec, index) => {
+      const raw = window.localStorage.getItem(spec[1]);
+      const value = raw === null ? undefined : JSON.parse(raw);
+      return index === 0 ? toggles(value) : profile(value);
+    });
+    const responses = await Promise.all([
+      api.get('plugin/dashboard/meta'),
+      ...specs.map(spec => api.get('user/config/' + spec[0]))
+    ]);
+    const meta = payload(responses[0]);
+    if (!Array.isArray(meta) || !meta.some(item => record(item) &&
+        (item.id + (item.key ? ':' + item.key : '')) === widget)) {
+      throw new Error('请先保存并启用插件，再点击“显示到首页”。');
+    }
+    const remote = responses.slice(1).map((response, index) =>
+      index === 0 ? toggles(valueOf(response)) : profile(valueOf(response)));
+    const legacy = remote[0] === undefined ? (local[0] || {}) : remote[0];
+    const updates = [{...legacy, [widget]: true}];
+    for (let index = 1; index < specs.length; index++) {
+      const server = remote[index];
+      const browser = local[index];
+      // Match MP's remote/local conflict rule, preserving the selected layout.
+      const browserNewer = browser && browser.updatedAt !== undefined &&
+        (!server || server.updatedAt === undefined || browser.updatedAt > server.updatedAt);
+      const selected = copy(browserNewer ? browser : (server || browser || {items: {}}));
+      const enabled = selected.enabled === undefined
+        ? ((browser && browser.enabled) || legacy) : selected.enabled;
+      selected.enabled = {...enabled, [widget]: true};
+      selected.updatedAt = Math.max(Date.now(), (selected.updatedAt || 0) + 1);
+      updates.push(selected);
+    }
+    // No DashboardOrder or widget coordinates are changed. MP places the new
+    // item automatically and merges its own defaults for missing built-in flags.
+    let cacheWarning = false;
+    for (let index = 0; index < specs.length; index++) {
+      const result = envelope(await api.post('user/config/' + specs[index][0], updates[index]));
+      if (!record(result) || result.success !== true) throw new Error('MoviePilot 未确认保存首页设置。');
+      written++;
+      try { window.localStorage.setItem(specs[index][1], JSON.stringify(updates[index])); }
+      catch (_) { cacheWarning = true; }
+    }
+    model.home_message = '已为当前用户显示到首页。请刷新 MoviePilot 页面后打开首页；原有组件、位置和显示选择均保留。' +
+      (cacheWarning ? ' 浏览器缓存未同步，重新加载时以服务器设置为准。' : '');
+  } catch (error) {
+    model.home_error = true;
+    const known = error && typeof error.message === 'string' &&
+      /^(当前前端|MoviePilot|首页|请先保存)/.test(error.message) ? error.message : '读取或保存首页设置失败，请检查连接后重试。';
+    model.home_message = known + (written ? ' 部分设置已保存；尚未全部完成，请重试。' : '');
+  } finally {
+    model.home_busy = false;
+  }
+}'''
+
+
+def homepage_action_fields(plugin):
+    action = HOME_DASHBOARD_ACTION.replace(
+        "__DASHBOARD_ID__", json.dumps(plugin.__class__.__name__ + ":archive")
+    )
+    return [
+        {"component": "VBtn", "props": {
+            "variant": "tonal", "color": "primary", "prepend-icon": "mdi-view-dashboard-plus-outline",
+            "disabled": "{{ home_busy }}", "loading": "{{ home_busy }}", "onClick": action,
+        }, "text": "显示到首页"},
+        {"component": "VAlert", "props": {
+            "show": "{{ !!home_message }}", "text": "{{ home_message }}", "variant": "tonal", "class": "mt-3",
+            "type": "{{ home_busy ? 'info' : (home_error ? 'warning' : 'success') }}",
+        }},
+    ]
+
+
 class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "整理事件入队、归档状态仪表盘与宿主机控制。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.0"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -185,6 +327,11 @@ class GDriveArchiverBridge(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.stop_service()
         config = dict(config) if isinstance(config, dict) else {}
+        home_reset = any(config.get(key, default) != default for key, default in
+                         (("home_busy", False), ("home_error", False), ("home_message", "")))
+        config.update(home_busy=False, home_error=False, home_message="")
+        if home_reset and config.get("onlyonce") is not True:
+            self.update_config(config)
         with self._lock:
             self._library_root = str(config.get("library_root") or "/media")
             self._bridge_dir = str(config.get("bridge_dir") or "/bridge")
@@ -246,15 +393,16 @@ class GDriveArchiverBridge(_PluginBase):
         return {"component": component, "props": {"model": model, "label": label, **extra}}
 
     def get_form(self):
-        fields_json = [
+        fields_json = homepage_action_fields(self) + [
             self._field("VSwitch", "enabled", "启用插件"),
             self._field("VTextField", "library_root", "MoviePilot 媒体根目录"),
             self._field("VTextField", "bridge_dir", "共享 bridge 目录"),
             self._field("VSwitch", "notify_results", "通过 MoviePilot 发送结果通知"),
             self._field("VTextField", "outbox_poll_seconds", "通知轮询间隔（2–5 秒）", type="number"),
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text":
-                "仪表盘每 3 秒刷新。下面选择操作并勾选执行一次后保存；提交不代表执行成功，请在仪表盘查看回执。暂停会等待当前文件完成。"}},
+                "首页仪表盘每 3 秒刷新；可在主页仪表盘设置中添加“Google Drive 归档”。先选择操作，再勾选执行一次并保存；请以操作回执为准。暂停会跨重启保留，需要执行继续上传解除。"}},
             self._field("VSelect", "control_action", "操作", items=[
+                {"title": "请选择操作", "value": ""},
                 {"title": "暂停新上传", "value": "pause"}, {"title": "继续上传", "value": "resume"},
                 {"title": "重试任务", "value": "retry"}, {"title": "重新检查账号", "value": "check_accounts"},
                 {"title": "手动添加媒体目录", "value": "enqueue"}]),
@@ -263,8 +411,9 @@ class GDriveArchiverBridge(_PluginBase):
             self._field("VSwitch", "onlyonce", "执行一次所选操作（保存后自动关闭）"),
         ]
         return [{"component": "VForm", "content": fields_json}], {
+            "home_busy": False, "home_error": False, "home_message": "",
             "enabled": False, "library_root": "/media", "bridge_dir": "/bridge", "notify_results": False,
-            "outbox_poll_seconds": 3, "control_action": "pause", "control_job_id": "",
+            "outbox_poll_seconds": 3, "control_action": "", "control_job_id": "",
             "control_relative_path": "", "onlyonce": False}
 
     def _bridge_path(self, *parts):
@@ -324,9 +473,11 @@ class GDriveArchiverBridge(_PluginBase):
             for upload in view.uploads:
                 stamp = _time(upload.updated_at)
                 age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp else -1
-                if not view.online or not (0 <= age <= 15):
+                upload.active = view.online and 0 <= age <= 15 and upload.phase in {"uploading", "moving", "checking_size"}
+                if not upload.active:
                     upload.speed = 0
-                    upload.eta_seconds = 0
+                    upload.eta_seconds = -1
+            view.speed_bytes_per_second = sum(u.speed for u in view.uploads if u.active and u.phase == "uploading")
             warnings = raw.get("warnings")
             view.warnings = [_text(x) for x in warnings[:20] if isinstance(x, str)] if isinstance(warnings, list) else []
             counts = raw.get("job_counts")
@@ -417,56 +568,276 @@ class GDriveArchiverBridge(_PluginBase):
         return [{"key": "archive", "name": "Google Drive 归档"}]
 
     def get_dashboard(self, key: str = "archive", **kwargs):
-        return {"cols": 12}, {"title": "Google Drive 归档", "refresh": 3}, self.get_page()
+        return {"cols": 12, "md": 12}, {"title": "Google Drive 归档", "refresh": 3}, self._render_archive(self.get_status(), True)
+
+    @staticmethod
+    def _view_node(component, text=None, content=None, **props):
+        """Use MP's escaped text interpolation; never emit a raw html node."""
+        node = {"component": component}
+        if component == "VCard" and props.get("variant") == "outlined":
+            props["style"] = props.get("style", "") + ";border:1px solid rgba(var(--v-theme-on-surface),0.12)"
+        if props:
+            node["props"] = props
+        if text is not None:
+            node["text"] = _text(str(text), 2000)
+        if content is not None:
+            node["content"] = content
+        return node
 
     @staticmethod
     def _size(value):
         value = _number(value)
         for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
             if value < 1024 or unit == "TiB":
-                return f"{value:.1f} {unit}"
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
             value /= 1024
 
     @staticmethod
-    def _list(title, rows):
-        return {"component": "VCard", "props": {"variant": "outlined", "class": "my-3"}, "content": [
-            {"component": "VCardTitle", "text": title},
-            {"component": "VList", "props": {"density": "compact"}, "content": [
-                {"component": "VListItem", "props": {"title": _text(name), "subtitle": _text(detail, 2000)}}
-                for name, detail in (rows or [("暂无记录", "")])]}]}
+    def _eta(value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value <= 2 ** 63 - 1 or not math.isfinite(value):
+            return "—"
+        seconds = int(value)
+        if seconds < 60:
+            return "不足 1 分钟"
+        minutes = (seconds + 59) // 60
+        if minutes < 60:
+            return f"约 {minutes} 分钟"
+        hours, minutes = divmod(minutes, 60)
+        return f"约 {hours} 小时" + (f" {minutes} 分钟" if minutes else "")
+
+    @staticmethod
+    def _ago(value):
+        stamp = _time(value)
+        if not stamp:
+            return "暂无记录"
+        seconds = int((datetime.now(timezone.utc) - stamp).total_seconds())
+        if seconds < -5:
+            return "时间异常"
+        if seconds < 10:
+            return "刚刚"
+        if seconds < 60:
+            return f"{seconds} 秒前"
+        if seconds < 3600:
+            return f"{seconds // 60} 分钟前"
+        if seconds < 86400:
+            return f"{seconds // 3600} 小时前"
+        return f"{seconds // 86400} 天前"
+
+    @staticmethod
+    def _status_label(value):
+        return {"queued": "等待上传", "waiting_stable": "等待文件稳定", "uploading": "上传中",
+                "preparing": "准备中", "moving": "移动到团队盘", "checking_size": "检查文件大小",
+                "retrying": "等待重试", "waiting_account": "等待可用账号", "failed": "失败待处理",
+                "complete": "已完成", "healthy": "可用", "disabled": "已禁用", "cooldown": "冷却中",
+                "budget_exhausted": "预算已用完", "unknown": "待检查", "error": "异常", "paused": "已暂停",
+                "done": "已执行", "pending": "等待回执", "rejected": "已拒绝", "info": "提示",
+                "warning": "提醒", "success": "成功", "recovered": "已恢复", "enabled": "已启用"}.get(value, "状态更新")
+
+    @staticmethod
+    def _status_color(value):
+        return {"healthy": "success", "complete": "success", "done": "success", "success": "success",
+                "disabled": "error", "failed": "error", "error": "error", "rejected": "error",
+                "cooldown": "warning", "budget_exhausted": "warning", "retrying": "warning",
+                "waiting_account": "warning", "paused": "warning", "warning": "warning",
+                "uploading": "primary", "moving": "primary", "checking_size": "primary"}.get(value, "secondary")
+
+    def _view_summary(self, state):
+        active = [u for u in state.uploads if state.online and getattr(u, "active", False)]
+        active_jobs = {u.job_id for u in active if u.job_id}
+        unfinished = [j for j in state.jobs if j.status != "complete"]
+        counts = state.job_counts or {}
+        pending = max(0, sum(_number(v, True) for k, v in counts.items() if k != "complete") - len(active_jobs))
+        remaining = sum(max(0, j.bytes_total - j.bytes_done) for j in unfinished)
+        known_jobs = {j.id for j in unfinished}
+        remaining -= sum(min(u.bytes, u.size) for u in active if u.job_id in known_jobs)
+        return {"active": active, "active_jobs": active_jobs, "pending": pending,
+                "speed": sum(u.speed for u in active if u.phase == "uploading"),
+                "healthy": sum(a.status == "healthy" for a in state.accounts),
+                "errors": sum(_number(counts.get(k), True) for k in ("failed", "retrying", "waiting_account")),
+                "remaining_files": sum(max(0, j.files_total - j.files_done) for j in unfinished),
+                "remaining_bytes": max(0, remaining)}
+
+    def _overview(self, state, summary):
+        n = self._view_node
+        active = len(summary["active"])
+        if not state.online:
+            title, color, icon = "归档器离线", "grey", "mdi-cloud-off-outline"
+            subtitle = "显示上次快照，等待归档器连接" if state.updated_at else "等待宿主机状态，请检查 bridge 目录"
+        elif state.paused:
+            title, color, icon = "暂停派发", "warning", "mdi-pause-circle-outline"
+            subtitle = "当前文件完成后暂停新上传" if active else "已暂停新上传，队列将继续保留"
+        elif active:
+            title, color, icon = "正在归档", "success", "mdi-cloud-upload-outline"
+            subtitle = "文件上传至个人盘，再移入目标团队盘"
+        elif summary["errors"] or (summary["pending"] and not summary["healthy"]):
+            title, color, icon = "存在待处理任务", "error", "mdi-alert-circle-outline"
+            subtitle = "请在详情中查看任务与账号异常"
+        else:
+            title, color, icon = "等待任务", "primary", "mdi-cloud-check-outline"
+            subtitle = "等待文件稳定或新的整理完成事件"
+        if not state.enabled:
+            subtitle = "插件未启用，整理事件不会自动入队"
+        header = n("VRow", content=[
+            n("VCol", content=[n("VIcon", icon=icon, color=color, size=28),
+                n("div", text="Google Drive", **{"class": "text-subtitle-1 font-weight-bold"}),
+                n("VChip", text=title, color=color, size="small", variant="tonal")],
+                cols=12, sm=8, **{"class": "d-flex align-center flex-wrap ga-2"}),
+            n("VCol", text="最近同步 · " + self._ago(state.updated_at), cols=12, sm=4,
+                **{"class": "text-caption text-medium-emphasis text-sm-end"})], align="center", dense=True)
+        tiles = [("活动文件", str(active), f"上限 {state.upload_workers or '—'} 路", "mdi-file-upload-outline", color),
+                 ("当前速度", self._size(summary["speed"]) + "/s", "当前传输合计" if active else "当前没有活动上传", "mdi-speedometer", "primary"),
+                 ("待处理任务", str(summary["pending"]), "含等待、重试与失败任务", "mdi-format-list-bulleted", "warning"),
+                 ("健康账号", f"{summary['healthy']}/{len(state.accounts)}" if state.online else "—",
+                  "可参与新上传" if state.online else "快照过期，等待复查", "mdi-account-check-outline", "success" if state.online else "grey")]
+        stats = []
+        for label, value, hint, tile_icon, tile_color in tiles:
+            stats.append(n("VCol", content=[n("VCard", content=[n("VCardText", content=[
+                n("div", content=[n("VIcon", icon=tile_icon, size=17, color=tile_color), n("span", text=label)],
+                  **{"class": "d-flex align-center ga-1 text-caption text-medium-emphasis"}),
+                n("div", text=value, **{"class": "text-h6 font-weight-bold my-1", "style": "font-variant-numeric:tabular-nums;overflow-wrap:anywhere"}),
+                n("div", text=hint, **{"class": "text-caption text-medium-emphasis"})], **{"class": "pa-3"})],
+                variant="outlined", rounded="lg", **{"class": "h-100"})], cols=6, sm=3))
+        return n("VCard", content=[n("VCardText", content=[header,
+            n("div", text=subtitle, **{"class": "text-body-2 text-medium-emphasis mt-1 mb-3"}),
+            n("VRow", content=stats, dense=True),
+            n("div", text=f"已列任务待传：{summary['remaining_files']} 个文件 · {self._size(summary['remaining_bytes'])}",
+              **{"class": "text-caption text-medium-emphasis mt-3"})], **{"class": "pa-4"})], variant="flat", rounded="lg")
+
+    def _transfer_cards(self, state, limit):
+        n = self._view_node
+        uploads = sorted(state.uploads, key=lambda u: not getattr(u, "active", False))[:limit]
+        if not uploads:
+            text = "已暂停新上传" if state.paused else "当前没有活动传输"
+            return [n("VCard", content=[n("VCardText", content=[
+                n("VIcon", icon="mdi-tray-arrow-up", color="secondary", size=22),
+                n("span", text=text, **{"class": "text-body-2"})], **{"class": "d-flex align-center ga-2 py-4"})],
+                variant="tonal", rounded="lg")]
+        cards = []
+        for upload in uploads:
+            fresh = state.online and getattr(upload, "active", False)
+            color = "primary" if fresh else "grey"
+            phase = self._status_label(upload.phase) if fresh else ("准备中" if state.online and upload.phase == "preparing" else "上次传输快照")
+            percent = min(100, max(0, upload.bytes * 100 / upload.size)) if upload.size else 0
+            filename = upload.file or upload.relative_path or "未命名文件"
+            eta = self._eta(upload.eta_seconds) if fresh and upload.phase == "uploading" else "—"
+            speed = self._size(upload.speed) + "/s" if fresh and upload.phase == "uploading" else "—"
+            cards.append(n("VCard", content=[n("VCardText", content=[
+                n("div", text=filename, **{"class": "text-body-2 font-weight-medium mb-2", "style": "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere"}),
+                n("div", content=[n("VChip", text=phase, color=color, size="x-small", variant="tonal"),
+                    n("VChip", text=upload.account or "分配账号中", size="x-small", variant="outlined")],
+                  **{"class": "d-flex flex-wrap align-center ga-2 mb-3"}),
+                n("VProgressLinear", **{"model-value": round(percent, 1), "height": 6, "rounded": True, "color": color}),
+                n("div", content=[n("span", text=f"{self._size(min(upload.bytes, upload.size))} / {self._size(upload.size)} · {percent:.0f}%"),
+                    n("span", text=f"{speed} · 剩余 {eta}")], **{"class": "d-flex justify-space-between flex-wrap ga-1 text-caption text-medium-emphasis mt-2"})],
+                **{"class": "pa-3"})], variant="outlined", rounded="lg", **{"class": "mb-2"}))
+        return cards
+
+    def _account_cards(self, state, limit, compact=False):
+        n = self._view_node
+        accounts = sorted(state.accounts, key=lambda a: (not (state.online and a.active_uploads), a.status == "healthy"))[:limit]
+        if not accounts:
+            return [n("VAlert", text="尚未发现上传账号", variant="tonal", type="info", density="compact")]
+        cards = []
+        for account in accounts:
+            color = self._status_color(account.status) if state.online else "grey"
+            percent = min(100, max(0, account.reserved_bytes * 100 / account.budget_bytes)) if account.budget_bytes else 0
+            status = self._status_label(account.status) + (" · 上次状态" if not state.online else "")
+            cooldown = _time(account.cooldown_until)
+            seconds = (cooldown - datetime.now(timezone.utc)).total_seconds() if cooldown else -1
+            meta = "自带 OAuth" if account.oauth_client == "custom" else "内置 OAuth" if account.oauth_client == "builtin" else "OAuth 未知"
+            meta += " · 总容量 " + self._size(account.capacity_bytes)
+            if account.status == "cooldown":
+                meta += " · 冷却剩余 " + self._eta(seconds)
+            if compact:
+                content = [n("div", text=account.name or "未命名账号", **{"class": "text-caption font-weight-medium mb-1",
+                    "style": "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere"}),
+                    n("div", content=[n("VChip", text=status, color=color, size="x-small", variant="tonal"),
+                        n("span", text=self._ago(account.last_health_check), **{"class": "text-caption text-medium-emphasis"})],
+                        **{"class": "d-flex justify-space-between align-center flex-wrap ga-1 mb-2"}),
+                    n("VProgressLinear", **{"model-value": round(percent, 1), "height": 4, "rounded": True, "color": color}),
+                    n("div", text=f"预算剩余 {self._size(account.remaining_bytes)} · 已预留 {percent:.0f}%",
+                      **{"class": "text-caption text-medium-emphasis mt-1"})]
+                if account.last_error:
+                    content.append(n("div", text=account.last_error[:140], **{"class": "text-caption text-error mt-1",
+                        "style": "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere"}))
+                cards.append(n("VCard", content=[n("VCardText", content=content, **{"class": "pa-2"})], variant="outlined", rounded="lg", **{"class": "mb-2"}))
+                continue
+            content = [n("div", content=[n("span", text=account.name or "未命名账号", **{"class": "text-body-2 font-weight-medium", "style": "overflow-wrap:anywhere"}),
+                n("VChip", text=status, color=color, size="x-small", variant="tonal")], **{"class": "d-flex align-center justify-space-between flex-wrap ga-2"}),
+                n("div", text=meta, **{"class": "text-caption text-medium-emphasis mt-1 mb-2"}),
+                n("VProgressLinear", **{"model-value": round(percent, 1), "height": 4, "rounded": True, "color": color}),
+                n("div", text=f"本机 24h 预留 {self._size(account.reserved_bytes)} / {self._size(account.budget_bytes)} · 预算剩余 {self._size(account.remaining_bytes)}",
+                  **{"class": "text-caption text-medium-emphasis mt-2"}),
+                n("div", text="最近检查 · " + self._ago(account.last_health_check), **{"class": "text-caption text-medium-emphasis mt-1"})]
+            if account.last_error:
+                content.append(n("div", text=account.last_error, **{"class": "text-caption text-error mt-2", "style": "overflow-wrap:anywhere"}))
+            cards.append(n("VCard", content=[n("VCardText", content=content, **{"class": "pa-3"})], variant="outlined", rounded="lg", **{"class": "mb-2"}))
+        return cards
+
+    def _detail_panel(self, title, content):
+        n = self._view_node
+        return n("VExpansionPanel", content=[n("VExpansionPanelTitle", text=title), n("VExpansionPanelText", content=content)])
+
+    def _detail_rows(self, rows):
+        n = self._view_node
+        return [n("VList", content=[n("VListItem", content=[
+            n("div", text=title, **{"class": "text-body-2 font-weight-medium", "style": "overflow-wrap:anywhere"}),
+            n("div", text=detail, **{"class": "text-caption text-medium-emphasis mt-1", "style": "white-space:pre-line;overflow-wrap:anywhere"})],
+            **{"class": "py-3"}) for title, detail in rows], density="compact")] if rows else [n("div", text="暂无记录", **{"class": "text-body-2 text-medium-emphasis py-3"})]
+
+    def _render_archive(self, state, compact):
+        n = self._view_node
+        summary = self._view_summary(state)
+        nodes = [self._overview(state, summary), n("VDivider", **{"class": "my-3"})]
+        transfers = [n("div", text="传输进度" if state.online else "上次传输进度", **{"class": "text-subtitle-2 font-weight-bold mb-2"})]
+        transfers.extend(self._transfer_cards(state, 3 if compact else 12))
+        if len(state.uploads) > (3 if compact else 12):
+            transfers.append(n("div", text=f"显示前 {3 if compact else 12}/{len(state.uploads)} 条传输", **{"class": "text-caption text-medium-emphasis mb-3"}))
+        if compact:
+            accounts = [n("div", text="账号与上传预算", **{"class": "text-subtitle-2 font-weight-bold mb-2"}),
+                n("div", content=[n("VChip", text=f"{summary['healthy']} 个可用" if state.online else "上次账号状态", color="success" if state.online else "grey", size="x-small", variant="tonal"),
+                    n("VChip", text=f"{len(state.accounts) - summary['healthy']} 个不可用", color="warning" if state.online else "grey", size="x-small", variant="tonal")],
+                    **{"class": "d-flex flex-wrap ga-1 mb-2"})]
+            accounts.extend(self._account_cards(state, 3, True))
+            if len(state.accounts) > 3:
+                accounts.append(n("div", text=f"显示前 3/{len(state.accounts)} 个账号，当前使用账号优先", **{"class": "text-caption text-medium-emphasis mb-2"}))
+            nodes.append(n("VRow", content=[n("VCol", content=transfers, cols=12, md=8), n("VCol", content=accounts, cols=12, md=4)], dense=True))
+            if state.warnings:
+                nodes.append(n("VAlert", content=[n("div", text=state.warnings[0][:180],
+                    style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere")],
+                    type="warning", variant="tonal", density="compact", **{"class": "my-2"}))
+            nodes.append(n("div", text="预算为本机滚动 24 小时预留估算。完整队列与操作回执请查看插件详情；操作入口位于插件设置。",
+                           **{"class": "text-caption text-medium-emphasis mt-3"}))
+            return nodes
+        nodes.extend(transfers)
+        jobs = []
+        for job in state.jobs[:50]:
+            label = self._status_label(job.status)
+            if job.status == "uploading" and job.id not in summary["active_jobs"]:
+                label = "已暂停" if state.paused else "等待调度"
+            detail = f"{label} · {job.files_done}/{job.files_total} 个文件 · {self._size(job.bytes_done)}/{self._size(job.bytes_total)}"
+            detail += "\n最近更新 " + self._ago(job.updated_at) + " · 任务 ID " + job.id
+            if job.last_error:
+                detail += "\n" + job.last_error
+            jobs.append((job.relative_path or "未命名任务", detail))
+        actions = {"pause": "暂停新上传", "resume": "恢复上传", "retry": "重试任务", "check_accounts": "检查账号", "enqueue": "手动入队"}
+        panels = [self._detail_panel(f"任务队列 · 显示 {len(jobs)}/{sum(state.job_counts.values())} 项", self._detail_rows(jobs)),
+                  self._detail_panel(f"上传账号 · 显示 {min(50, len(state.accounts))}/{len(state.accounts)} 项", self._account_cards(state, 50)),
+                  self._detail_panel("操作回执 · 最近 20 条", self._detail_rows([
+                      (actions.get(c.action, "操作") + " · " + self._status_label(c.status), c.message + "\n" + self._ago(c.created_at) + " · " + c.id)
+                      for c in state.commands[:20]])),
+                  self._detail_panel("最近事件 · 最近 20 条", self._detail_rows([
+                      (self._status_label(e.status) + " · " + self._ago(e.at), e.message) for e in list(reversed(state.recent_events))[:20]]))]
+        if state.warnings:
+            panels.append(self._detail_panel("提示与诊断", self._detail_rows([("提示", x) for x in state.warnings[:10]])))
+        nodes.append(n("VExpansionPanels", content=panels, multiple=True, variant="accordion", **{"class": "mt-4"}))
+        nodes.append(n("VAlert", text="操作入口：插件设置 → 选择操作 → 执行一次 → 保存。以“已执行”回执为准。预算是本机滚动 24 小时预留估算；待传数量仅统计已列出且已扫描的任务。",
+                       type="info", variant="tonal", density="compact", **{"class": "mt-4"}))
+        return nodes
 
     def get_page(self):
-        state = self.get_status()
-        size = self._size
-        page = [{"component": "VAlert", "props": {"type": "success" if state.online else "warning", "variant": "tonal",
-                 "text": f"{state.message} · {size(state.speed_bytes_per_second)}/s · {len(state.uploads)} 个传输 · 更新 {state.updated_at or '无'}"}},
-                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "my-2", "text":
-                 "控制入口：插件设置 → 选择操作 → 执行一次 → 保存。下方回执 done 才表示宿主机确认。额度是本机滚动 24 小时预留估算，不是 Google 精确剩余额度。"}}]
-        labels = {"queued": "排队", "waiting_stable": "等待稳定", "uploading": "上传", "retrying": "重试",
-                  "waiting_account": "等待账号", "failed": "失败", "complete": "完成"}
-        summary = " · ".join(f"{labels.get(status, status)} {count}" for status, count in state.job_counts.items())
-        page.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "my-2",
-                     "text": f"任务总计 {sum(state.job_counts.values())} · {summary or '暂无任务'}"}})
-        if len(state.jobs) > 50:
-            page.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                         "text": f"本页仅展示公开快照中的前 50/{len(state.jobs)} 项；任务总数见上方汇总。"}})
-        page.append(self._list("正在传输", [(u.file or u.relative_path,
-            f"{u.phase} · {u.account} · {size(u.bytes)}/{size(u.size)} · {size(u.speed)}/s · ETA {u.eta_seconds}s") for u in state.uploads]))
-        page.append(self._list("任务（最多显示 50 项）", [(j.relative_path,
-            f"{j.status} · {j.files_done}/{j.files_total} 文件 · {size(j.bytes_done)}/{size(j.bytes_total)} · ID {j.id} · {j.last_error}") for j in state.jobs[:50]]))
-        account_rows = []
-        for account in state.accounts:
-            stamp = _time(account.cooldown_until)
-            cooldown = max(0, int((stamp - datetime.now(timezone.utc)).total_seconds())) if stamp else 0
-            account_rows.append((account.name, f"{account.status} · client {account.oauth_client} · 容量 {size(account.capacity_bytes)} · "
-                f"本地24h预留 {size(account.reserved_bytes)} / 预算 {size(account.budget_bytes)} · 剩余 {size(account.remaining_bytes)} · "
-                f"并发 {account.active_uploads} · 冷却 {cooldown}s · {account.last_error}"))
-        page.append(self._list("账号", account_rows))
-        page.append(self._list("操作回执", [(c.action + " · " + c.status, c.message + " · " + c.id) for c in state.commands]))
-        page.append(self._list("最近事件", [(e.at + " · " + e.status, e.message) for e in reversed(state.recent_events)]))
-        if state.warnings:
-            page.append(self._list("提示", [("提示", message) for message in state.warnings]))
-        return page
+        return self._render_archive(self.get_status(), False)
+
 
     @eventmanager.register(EventType.TransferComplete)
     def enqueue_transfer(self, event: Event):

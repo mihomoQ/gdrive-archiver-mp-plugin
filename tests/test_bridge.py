@@ -141,10 +141,10 @@ class BridgeContract:
     def test_status_online_and_stale_zeroes_all_live_speed(self):
         stamp = datetime.now(timezone.utc).isoformat()
         for age, online in [(0, True), (16, False)]:
-            self.status(age, uploads=[{"file": "a.mkv", "size": 200, "bytes": 100, "speed": 50, "eta_seconds": 2, "updated_at": stamp}])
+            self.status(age, uploads=[{"file": "a.mkv", "phase": "uploading", "size": 200, "bytes": 100, "speed": 50, "eta_seconds": 2, "updated_at": stamp}])
             result = self.plugin.get_status()
             self.assertEqual(online, result.online)
-            self.assertEqual(123 if online else 0, result.speed_bytes_per_second)
+            self.assertEqual(50 if online else 0, result.speed_bytes_per_second)
             self.assertEqual(50 if online else 0, result.uploads[0].speed)
 
     def test_old_upload_speed_zero_even_with_fresh_daemon(self):
@@ -290,12 +290,12 @@ class DistributionTests(unittest.TestCase):
     def test_self_contained_versions_stay_in_parity(self):
         v2 = (ROOT / "plugins.v2/gdrivearchiverbridge/__init__.py").read_text(encoding="utf-8")
         v3 = (ROOT / "plugins.v3/gdrivearchiverbridge/__init__.py").read_text(encoding="utf-8")
-        v2 = v2.replace("app.core.event", "app.sdk.events").replace("app.log import", "app.sdk.logging import").replace("app.plugins import", "app.sdk.plugin import").replace('plugin_version = "2.0.0"', 'plugin_version = "3.0.0"')
+        v2 = v2.replace("app.core.event", "app.sdk.events").replace("app.log import", "app.sdk.logging import").replace("app.plugins import", "app.sdk.plugin import").replace('plugin_version = "2.1.0"', 'plugin_version = "3.1.0"')
         self.assertEqual(v2, v3)
         for version in (2, 3):
             manifest = json.loads((ROOT / f"package.v{version}.json").read_text(encoding="utf-8"))["GDriveArchiverBridge"]
-            self.assertEqual(f"{version}.0.0", manifest["version"])
-            self.assertIn(f"v{version}.0.0", manifest["history"])
+            self.assertEqual(f"{version}.1.0", manifest["version"])
+            self.assertIn(f"v{version}.1.0", manifest["history"])
             self.assertIn(f">={version}.0.0", manifest["system_version"])
 
 
