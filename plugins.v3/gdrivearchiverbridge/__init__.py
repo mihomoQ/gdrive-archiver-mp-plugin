@@ -305,7 +305,7 @@ class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "整理事件入队、归档状态仪表盘与宿主机控制。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "3.2.1"
+    plugin_version = "3.3.0"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -315,6 +315,9 @@ class GDriveArchiverBridge(_PluginBase):
     def __init__(self):
         super().__init__()
         self._lock = threading.RLock()
+        self._notification_lock = threading.Lock()
+        self._retry_lock = threading.Lock()
+        self._generation = 0
         self._enabled = False
         self._notify_results = False
         self._aggregate_upload_speed = True
@@ -323,6 +326,11 @@ class GDriveArchiverBridge(_PluginBase):
         self._outbox_poll_seconds = 3
         self._receipts = []
         self._commands = []
+        self._commands_dirty = False
+        self._pending_jobs = {}
+        self._pending_loaded = False
+        self._pending_dirty = False
+        self._pending_error = ""
         self._control_error = ""
 
     def init_plugin(self, config: dict = None):
@@ -343,10 +351,24 @@ class GDriveArchiverBridge(_PluginBase):
                 self._outbox_poll_seconds = max(2, min(5, int(config.get("outbox_poll_seconds") or 3)))
             except (ValueError, TypeError):
                 self._outbox_poll_seconds = 3
-            receipts = self.get_data("notice_receipts")
-            self._receipts = [x for x in receipts if isinstance(x, str)][-256:] if isinstance(receipts, list) else []
-            history = self.get_data("commands")
-            self._commands = [x for x in history if isinstance(x, dict) and _HEX32.fullmatch(str(x.get("id", "")))][-20:] if isinstance(history, list) else []
+            try:
+                receipts = self.get_data("notice_receipts")
+                stored = [x for x in receipts if isinstance(x, str)] if isinstance(receipts, list) else []
+                self._receipts = list(dict.fromkeys(stored + self._receipts))[-256:]
+                history = self.get_data("commands")
+                stored = [x for x in history if isinstance(x, dict) and _HEX32.fullmatch(str(x.get("id", "")))] if isinstance(history, list) else []
+                combined = {x["id"]: x for x in stored}
+                for item in self._commands:
+                    previous = combined.get(item["id"], {})
+                    if previous.get("status") not in {"done", "error"} or item.get("status") in {"done", "error"}:
+                        combined[item["id"]] = item
+                self._commands = list(combined.values())[-20:]
+                for item in self._commands:
+                    item.setdefault("bridge_dir", str(Path(self._bridge_dir).resolve()))
+            except Exception:
+                logger.warning("Google Drive 归档暂时无法读取通知或操作历史，保留当前内存状态。")
+            self._pending_loaded = False
+            self._load_pending_locked()
             if config.get("onlyonce") is True:
                 # Reset BEFORE submitting, so an MP reload cannot replay a control.
                 config["onlyonce"] = False
@@ -397,17 +419,133 @@ class GDriveArchiverBridge(_PluginBase):
         ]
 
     def get_service(self):
-        if not self._enabled or not self._notify_results:
+        if not self._enabled:
             return []
-        return [{"id": self.__class__.__name__ + ".Outbox", "name": "Google Drive 归档结果通知",
-                 "trigger": "interval", "func": self._poll_outbox,
-                 "kwargs": {"seconds": self._outbox_poll_seconds, "max_instances": 1, "coalesce": True}}]
+        services = [{"id": self.__class__.__name__ + ".Bridge", "name": "Google Drive 归档事件重投",
+                     "trigger": "interval", "func": self._retry_pending,
+                     "kwargs": {"seconds": self._outbox_poll_seconds, "max_instances": 1, "coalesce": True}}]
+        if self._notify_results:
+            services.append({"id": self.__class__.__name__ + ".Outbox", "name": "Google Drive 归档结果通知",
+                             "trigger": "interval", "func": self._poll_outbox,
+                             "kwargs": {"seconds": self._outbox_poll_seconds, "max_instances": 1, "coalesce": True}})
+        return services
 
     def stop_service(self):
         # The MP scheduler owns get_service jobs. No private thread/scheduler is
         # created; an already-dispatched callback rechecks this flag under lock.
         with self._lock:
             self._enabled = False
+            self._generation += 1
+
+    def _save_data_checked(self, key, value):
+        try:
+            result = self.save_data(key, value)
+        except Exception as error:
+            raise OSError("MoviePilot 插件数据暂时无法保存") from error
+        if result is False:
+            raise OSError("MoviePilot 未确认保存插件数据")
+
+    def _save_commands_locked(self):
+        if not self._commands_dirty:
+            return
+        try:
+            self._save_data_checked("commands", self._commands)
+            self._commands_dirty = False
+        except OSError:
+            logger.warning("Google Drive 操作历史暂未持久化，将稍后重试。")
+
+    def _load_pending_locked(self):
+        try:
+            stored = self.get_data("pending_jobs")
+            if stored is None:
+                stored = {}
+            if not isinstance(stored, dict):
+                raise ValueError("invalid pending queue")
+            for key, entry in stored.items():
+                if not isinstance(key, str) or not _HEX64.fullmatch(key) or not isinstance(entry, dict):
+                    raise ValueError("invalid pending record")
+                job = entry.get("job")
+                if not all(isinstance(entry.get(name), str) for name in ("library_root", "bridge_dir", "queue_id")) or not _HEX64.fullmatch(entry["queue_id"]):
+                    raise ValueError("invalid pending scope")
+                if not isinstance(job, dict) or type(job.get("version")) is not int or job["version"] != 1 or not _HEX64.fullmatch(str(job.get("id", ""))) or not isinstance(job.get("relative_path"), str):
+                    raise ValueError("invalid pending job")
+            self._pending_jobs = {**stored, **self._pending_jobs}
+            self._pending_loaded = True
+            self._pending_error = ""
+        except Exception:
+            self._pending_error = "待投队列暂时无法读取；保留内存事件，稍后重试。"
+
+    def _save_pending_locked(self, pending):
+        if not self._pending_loaded:
+            self._pending_dirty = True
+            return False
+        try:
+            self._save_data_checked("pending_jobs", pending)
+        except OSError:
+            self._pending_dirty = True
+            self._pending_error = "待投事件尚未持久化；请检查 MoviePilot 数据存储，程序会继续重试。"
+            return False
+        self._pending_jobs = pending
+        self._pending_dirty = False
+        self._pending_error = ""
+        return True
+
+    def _queue_pending_locked(self, job, library_root, bridge_dir):
+        if not self._pending_loaded:
+            self._load_pending_locked()
+        key = hashlib.sha256(f"{library_root}\x00{bridge_dir}\x00{job['id']}".encode("utf-8")).hexdigest()
+        previous = self._pending_jobs.get(key, {}).get("job", {})
+        merged = dict(job)
+        if previous.get("trigger") == "metadata_scrape" or job.get("trigger") == "metadata_scrape":
+            merged.update(trigger="metadata_scrape", completed_item="")
+        queue_id = hashlib.sha256(f"{merged['id']}\x00{merged['trigger']}\x00{merged.get('completed_item', '')}".encode("utf-8")).hexdigest()
+        self._pending_jobs[key] = {"library_root": library_root, "bridge_dir": bridge_dir, "queue_id": queue_id, "job": merged}
+        self._pending_dirty = True
+        self._save_pending_locked(dict(self._pending_jobs))
+
+    def _retry_pending(self):
+        if not self._retry_lock.acquire(blocking=False):
+            return
+        try:
+            with self._lock:
+                if not self._enabled:
+                    return
+                generation = self._generation
+                if not self._pending_loaded:
+                    self._load_pending_locked()
+                if self._pending_dirty:
+                    self._save_pending_locked(dict(self._pending_jobs))
+                self._save_commands_locked()
+                scope = (str(Path(self._library_root).resolve()), str(Path(self._bridge_dir).resolve()))
+                records = [(key, entry) for key, entry in self._pending_jobs.items()
+                           if (entry["library_root"], entry["bridge_dir"]) == scope][:100]
+            delivered = []
+            for key, entry in records:
+                with self._lock:
+                    if not self._enabled or self._generation != generation:
+                        return
+                    if self._pending_jobs.get(key) != entry:
+                        continue
+                    try:
+                        self._relative_directory(entry["job"]["relative_path"])
+                        self._atomic_write(self._scoped_bridge_path(scope[1], "inbox", entry["queue_id"] + ".json"), entry["job"])
+                    except (OSError, ValueError):
+                        self._pending_error = "桥接事件仍待投递，请检查 bridge 权限和原媒体目录。"
+                        continue
+                    delivered.append((key, entry))
+            with self._lock:
+                if delivered and self._enabled and self._generation == generation:
+                    remaining = dict(self._pending_jobs)
+                    for key, entry in delivered:
+                        if remaining.get(key) == entry:
+                            del remaining[key]
+                    # A failed acknowledgement keeps the records. One write
+                    # confirms the batch; repeated queue filenames are safe.
+                    self._save_pending_locked(remaining)
+        except (OSError, ValueError):
+            logger.warning("Google Drive 归档待投队列暂时无法处理。")
+        finally:
+            self._retry_lock.release()
 
     @staticmethod
     def _field(component, model, label, **extra):
@@ -439,7 +577,11 @@ class GDriveArchiverBridge(_PluginBase):
             "control_relative_path": "", "onlyonce": False}
 
     def _bridge_path(self, *parts):
-        root = Path(self._bridge_dir).resolve()
+        return self._scoped_bridge_path(self._bridge_dir, *parts)
+
+    @staticmethod
+    def _scoped_bridge_path(bridge_dir, *parts):
+        root = Path(bridge_dir).resolve()
         result = root.joinpath(*parts)
         if root not in result.resolve().parents:
             raise ValueError("bridge 路径越界")
@@ -528,9 +670,18 @@ class GDriveArchiverBridge(_PluginBase):
         except (OSError, ValueError, RecursionError):
             view.message = "未取得有效状态：归档器离线、尚未升级或 bridge 配置不一致。事件入队仍可使用。"
         with self._lock:
-            view.commands = [self.get_result(item["id"]) for item in reversed(self._commands[-20:])]
+            try:
+                scope = str(Path(self._bridge_dir).resolve())
+            except (OSError, ValueError):
+                scope = None
+            command_ids = [item["id"] for item in reversed(self._commands[-20:]) if scope is not None and item.get("bridge_dir", scope) == scope]
             if self._control_error:
                 view.warnings.append(self._control_error)
+            if self._pending_jobs:
+                view.warnings.append(f"有 {len(self._pending_jobs)} 个媒体目录待投递；旧媒体根目录或旧 bridge 的记录会保留，恢复原配置后重试。")
+            if self._pending_error:
+                view.warnings.append(self._pending_error)
+        view.commands = [self.get_result(command_id) for command_id in command_ids]
         return view
 
     def _relative_directory(self, value):
@@ -576,8 +727,9 @@ class GDriveArchiverBridge(_PluginBase):
                 self._atomic_write(self._bridge_path("commands", command["id"] + ".json"), command)
                 reply = CommandView(id=command["id"], action=action, status="pending",
                                     message="已提交，等待宿主机确认", created_at=command["created_at"])
-                self._commands = (self._commands + [asdict(reply)])[-20:]
-                self.save_data("commands", self._commands)
+                self._commands = (self._commands + [{**asdict(reply), "bridge_dir": str(Path(self._bridge_dir).resolve())}])[-20:]
+                self._commands_dirty = True
+                self._save_commands_locked()
                 return reply
             except (OSError, ValueError, RecursionError) as err:
                 return CommandView(action=action, message=_text(str(err)))
@@ -585,13 +737,40 @@ class GDriveArchiverBridge(_PluginBase):
     def get_result(self, command_id: str) -> CommandView:
         if not isinstance(command_id, str) or not _HEX32.fullmatch(command_id):
             return CommandView(message="无效命令 ID")
-        saved = next((x for x in self._commands if x["id"] == command_id), {})
+        with self._lock:
+            saved = dict(next((x for x in self._commands if x["id"] == command_id), {}))
+            generation = self._generation
+            try:
+                scope = str(Path(self._bridge_dir).resolve())
+            except (OSError, ValueError):
+                return CommandView(id=command_id, status="unknown", message="bridge 路径无效，无法查询回执")
+        if saved.get("status") in {"done", "error"}:
+            with self._lock:
+                self._save_commands_locked()
+            return _model(CommandView, saved)
+        if saved.get("bridge_dir", scope) != scope:
+            return CommandView(id=command_id, action=_text(saved.get("action")), status="unknown", message="bridge 配置已变化，未查询旧归档器的回执")
         try:
-            raw = self._read_json(self._bridge_path("results", command_id + ".json"))
-            if raw.get("version") != 2 or raw.get("id") != command_id or raw.get("action") not in _ACTIONS or raw.get("status") not in {"done", "error"}:
+            raw = self._read_json(self._scoped_bridge_path(scope, "results", command_id + ".json"))
+            if raw.get("version") != 2 or raw.get("id") != command_id or raw.get("action") not in _ACTIONS or raw.get("status") not in {"done", "error"} or (saved.get("action") and saved["action"] != raw["action"]):
                 raise ValueError("无效命令回执")
-            return _model(CommandView, raw)
+            result = _model(CommandView, raw)
+            with self._lock:
+                if self._generation != generation:
+                    return CommandView(id=command_id, status="unknown", message="插件配置已变化，请重新查询回执")
+                record = {**asdict(result), "bridge_dir": scope}
+                if saved != record:
+                    self._commands = [item for item in self._commands if item["id"] != command_id]
+                    self._commands = (self._commands + [record])[-20:]
+                    self._commands_dirty = True
+                self._save_commands_locked()
+            return result
         except FileNotFoundError:
+            if not saved:
+                return CommandView(id=command_id, status="unknown", message="没有此操作的提交记录或回执，无法确认执行状态")
+            created = _time(saved.get("created_at"))
+            if created is None or (datetime.now(timezone.utc) - created).total_seconds() > 24 * 3600:
+                return CommandView(id=command_id, action=_text(saved.get("action")), status="expired", message="回执已过期或被清理，无法确认执行结果", created_at=_text(saved.get("created_at")))
             return CommandView(id=command_id, action=_text(saved.get("action")), status="pending",
                                message="等待宿主机回执（尚未确认执行）", created_at=_text(saved.get("created_at")))
         except (OSError, ValueError, RecursionError):
@@ -667,7 +846,7 @@ class GDriveArchiverBridge(_PluginBase):
                 "retrying": "等待重试", "waiting_account": "等待可用账号", "failed": "失败待处理",
                 "complete": "已完成", "healthy": "可用", "disabled": "已禁用", "cooldown": "冷却中",
                 "budget_exhausted": "预算已用完", "unknown": "待检查", "error": "异常", "paused": "已暂停",
-                "done": "已执行", "pending": "等待回执", "rejected": "已拒绝", "info": "提示",
+                "done": "已执行", "pending": "等待回执", "expired": "回执已过期", "rejected": "已拒绝", "info": "提示",
                 "warning": "提醒", "success": "成功", "recovered": "已恢复", "enabled": "已启用"}.get(value, "状态更新")
 
     @staticmethod
@@ -910,57 +1089,84 @@ class GDriveArchiverBridge(_PluginBase):
                 queue_id = hashlib.sha256(f"{job_id}\x00{trigger}\x00{completed_item}".encode("utf-8")).hexdigest()
                 job = {"version": 1, "id": job_id, "source_path": str(target), "relative_path": relative,
                        "trigger": trigger, "completed_item": completed_item, "created_at": _now()}
-                self._atomic_write(self._bridge_path("inbox", queue_id + ".json"), job)
+                bridge_dir = str(Path(self._bridge_dir).resolve())
             except (OSError, ValueError):
                 logger.warning("Google Drive 归档事件路径无效或无法写入 bridge；请检查媒体根目录和目录权限。")
+                return
+            try:
+                self._atomic_write(self._scoped_bridge_path(bridge_dir, "inbox", queue_id + ".json"), job)
+            except (OSError, ValueError):
+                self._queue_pending_locked(job, str(root), bridge_dir)
+                logger.warning("Google Drive 桥接写入失败，媒体目录已保留在待投队列中，将自动重试。")
 
     def _poll_outbox(self):
-        if not self._lock.acquire(blocking=False):
+        if not self._notification_lock.acquire(blocking=False):
             return
         try:
-            if not self._enabled or not self._notify_results:
-                return
-            outbox = self._bridge_path("outbox")
+            with self._lock:
+                if not self._enabled or not self._notify_results:
+                    return
+                generation = self._generation
+                scope = str(Path(self._bridge_dir).resolve())
+            outbox = self._scoped_bridge_path(scope, "outbox")
             if not outbox.is_dir():
                 return
             # Recover claims left by a stopped MP, including the v1 UUID format.
             for claimed in sorted(outbox.glob(".*.processing"))[:100]:
-                self._notify_claim(claimed)
+                self._notify_claim(claimed, generation, scope)
             for result_path in sorted(outbox.glob("*.json"))[:100]:
-                if not self._enabled:
-                    break
                 claimed = result_path.with_name("." + result_path.name + ".processing")
-                if claimed.exists():
-                    continue
-                try:
-                    os.rename(result_path, claimed)
-                except FileNotFoundError:
-                    continue
-                self._notify_claim(claimed)
+                with self._lock:
+                    if not self._enabled or self._generation != generation:
+                        break
+                    if claimed.exists():
+                        continue
+                    try:
+                        os.rename(result_path, claimed)
+                    except FileNotFoundError:
+                        continue
+                self._notify_claim(claimed, generation, scope)
         except (OSError, ValueError):
             logger.warning("Google Drive 归档通知队列暂时无法读取。")
         finally:
-            self._lock.release()
+            self._notification_lock.release()
 
-    def _notify_claim(self, claimed):
-        if not self._enabled:
-            return
+    def _notify_claim(self, claimed, generation, scope):
+        with self._lock:
+            if not self._enabled or not self._notify_results or self._generation != generation:
+                return
         try:
             result = self._read_json(claimed)
             if result.get("version") != 1 or not isinstance(result.get("status"), str):
                 raise ValueError("无效通知格式")
-            receipt = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-            if receipt not in self._receipts:
+        except (ValueError, RecursionError):
+            with self._lock:
+                if self._generation == generation:
+                    claimed.replace(claimed.with_suffix(".invalid"))
+            logger.warning("Google Drive 归档跳过无效通知。")
+            return
+        except OSError:
+            logger.warning("Google Drive 归档通知暂时无法读取，将稍后重试。")
+            return
+        receipt = hashlib.sha256((scope + "\x00" + json.dumps(result, sort_keys=True, ensure_ascii=False)).encode("utf-8")).hexdigest()
+        try:
+            with self._lock:
+                if not self._enabled or self._generation != generation:
+                    return
+                sent = receipt in self._receipts
+            if not sent:
                 title = _text(result.get("title")) or "Google Drive 归档：" + _text(result["status"])
                 message = "\n".join(x for x in (_text(result.get("relative_path")), _text(result.get("message"), 3000)) if x)
+                # External notification calls must never hold the state lock:
+                # the native speed API, enqueue and stop remain responsive.
                 self.post_message(mtype=NotificationType.Plugin, title=title, text=message or "宿主机返回空结果。")
-                self._receipts = (self._receipts + [receipt])[-256:]
-                self.save_data("notice_receipts", self._receipts)
-            claimed.unlink()
-        except (ValueError, RecursionError):
-            # Quarantine malformed data once instead of retrying it every 3s.
-            claimed.replace(claimed.with_suffix(".invalid"))
-            logger.warning("Google Drive 归档跳过无效通知。")
+            with self._lock:
+                if self._generation != generation:
+                    return
+                if receipt not in self._receipts:
+                    self._receipts = (self._receipts + [receipt])[-256:]
+                self._save_data_checked("notice_receipts", self._receipts)
+                claimed.unlink()
         except Exception:
             # Keep the claim for a later retry when the MP notification service
             # is unavailable. Never log raw provider errors or credentials.
