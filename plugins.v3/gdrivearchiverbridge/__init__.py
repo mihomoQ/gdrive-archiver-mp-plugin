@@ -9,7 +9,7 @@ import threading
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional
 
 from app.sdk.events import Event, eventmanager
@@ -305,7 +305,7 @@ class GDriveArchiverBridge(_PluginBase):
     plugin_name = "Google Drive 归档桥接"
     plugin_desc = "整理事件入队、归档状态仪表盘与宿主机控制。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     plugin_author = "irisrclone"
     author_url = ""
     plugin_config_prefix = "gdrivearchiverbridge_"
@@ -534,7 +534,11 @@ class GDriveArchiverBridge(_PluginBase):
         return view
 
     def _relative_directory(self, value):
-        if not isinstance(value, str) or len(value) > 2048 or "\\" in value or ":" in value or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        if not isinstance(value, str) or len(value) > 2048 or "\\" in value or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("请输入媒体根目录下的相对目录")
+        # A colon is a normal POSIX filename character. Reject drive prefixes on
+        # every host, and Windows stream/filename colons only on Windows.
+        if PureWindowsPath(value).drive or (os.name == "nt" and ":" in value):
             raise ValueError("请输入媒体根目录下的相对目录")
         relative = PurePosixPath(value)
         if relative.is_absolute() or len(relative.parts) < 2 or any(x in (".", "..") for x in value.split("/")):

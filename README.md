@@ -8,8 +8,8 @@
 
 | MoviePilot | 索引 | 自包含源码 | 插件版本 |
 | --- | --- | --- | --- |
-| V2，`>=2.0.0,<3.0.0` | `package.v2.json` | `plugins.v2/gdrivearchiverbridge/__init__.py` | 2.2.0 |
-| V3，`>=3.0.0` | `package.v3.json` | `plugins.v3/gdrivearchiverbridge/__init__.py` | 3.2.0 |
+| V2，`>=2.0.0,<3.0.0` | `package.v2.json` | `plugins.v2/gdrivearchiverbridge/__init__.py` | 2.2.1 |
+| V3，`>=3.0.0` | `package.v3.json` | `plugins.v3/gdrivearchiverbridge/__init__.py` | 3.2.1 |
 
 V2 使用对应的历史宿主导入；V3 使用 `app.sdk.plugin`、`app.sdk.events` 和 `app.sdk.logging`。两个目录都能单独被 MP 安装，不需要安装另一版本的源码，无额外 Python 依赖。
 
@@ -85,6 +85,10 @@ V2 2.2.0 / V3 3.2.0 起，启用插件后默认把 archiver 的上传速度加�
 ## 媒体事件
 
 `TransferComplete` 按主视频文件触发。插件取 `transferinfo.target_diritem.path` 作为媒体根目录，记录 `target_item.path` 对应的具体集/文件；`MetadataScrape` 的目录信号用于重新开始稳定等待，它不表示刮削已经完成。兼容对象与字典形态的事件参数，只处理配置媒体根目录下的本地目录。
+
+新版归档器将 `欧美电影` 与 `外语电影` 作为缺省别名：只配置其中一个时，另一种目录名也会传到同一团队盘；若分别配置两项，则各自明确配置优先。别名解析及防重复目录修复需要更新宿主机 Go 程序，单独更新 MP 插件不包含这两项修复。被旧版拒绝的任务保留在 `bridge/rejected`，不会自动重新上传；确认源文件仍在后，可手动入队对应媒体目录。
+
+V2 2.2.1 / V3 3.2.1 起，Debian/Linux 的合法片名可以含英文冒号，例如 `电影/欧美电影/Example: Winter Summit (2026)`；仍拒绝 Windows 盘符、UNC、路径穿越和 Windows 不支持的冒号路径。
 
 同一个媒体目录合并为同一个任务，宿主机等待目录稳定后递归处理全部普通文件，包括 NFO、字幕和海报。`类别/片名` 与 `电影或剧集/类别/片名` 均保留相对路径，由宿主机按类别选择团队盘。安装前的旧媒体不会自动全盘入队，可用手动入队补充。
 
